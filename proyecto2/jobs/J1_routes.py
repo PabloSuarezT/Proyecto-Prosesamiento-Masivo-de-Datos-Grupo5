@@ -16,14 +16,14 @@ import os
 from pathlib import Path
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, when
+from pyspark.sql.functions import col, coalesce, lit, when
 from pyspark.sql.types import LongType
 
 PROJECT_DIR = Path(
     "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
 )
-SILVER_DIR = Path(os.environ.get("SILVER_DIR", str(PROJECT_DIR / "silver" / "buses_rm")))
-GOLD_DIR = Path(os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion")))
+SILVER_DIR = os.environ.get("SILVER_DIR", str(PROJECT_DIR / "silver" / "buses_rm"))
+GOLD_DIR = os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion"))
 
 PERIODO_A = "20260829"  # V167
 PERIODO_B = "20261003"  # V168
@@ -41,7 +41,7 @@ CAMPOS = [
 
 def routes_periodo(spark, periodo):
     return (
-        spark.read.parquet(str(SILVER_DIR / "routes"))
+        spark.read.parquet(f"{SILVER_DIR}/routes")
         .filter(col("periodo_feed") == periodo)
         .select("route_id", *[col(c) for c in CAMPOS])
     )
@@ -59,7 +59,14 @@ def main():
     print(f"[J1] routes A ({PERIODO_A}): {df_a.count()}")
     print(f"[J1] routes B ({PERIODO_B}): {df_b.count()}")
 
-    comparado = df_a.alias("a").join(df_b.alias("b"), df_a.route_id == df_b.route_id, "full_outer")
+    comparado = df_a.alias("a").join(
+        df_b.alias("b"), col("a.route_id") == col("b.route_id"), "full_outer"
+    )
+
+    exprs = [coalesce(col("a.route_id"), col("b.route_id")).alias("route_id")]
+    for c in CAMPOS:
+        exprs.append(col(f"a.{c}").alias(f"{c}_a"))
+        exprs.append(col(f"b.{c}").alias(f"{c}_b"))
 
     sin_cambio = (
         (col("route_short_name_a") == col("route_short_name_b"))
@@ -70,11 +77,6 @@ def main():
         & (col("route_text_color_a") == col("route_text_color_b"))
         & (col("route_url_a") == col("route_url_b"))
     )
-
-    exprs = [col("route_id")]
-    for c in CAMPOS:
-        exprs.append(col(f"{c}_a").alias(f"{c}_a"))
-        exprs.append(col(f"{c}_b").alias(f"{c}_b"))
 
     df_cambios = (
         comparado.select(*exprs)
@@ -89,7 +91,7 @@ def main():
         )
     )
 
-    df_cambios.write.mode("overwrite").parquet(str(GOLD_DIR / "g_routes_cambios"))
+    df_cambios.write.mode("overwrite").parquet(f"{GOLD_DIR}/g_routes_cambios")
     print(f"[J1] g_routes_cambios: {df_cambios.count()}")
 
     spark.stop()

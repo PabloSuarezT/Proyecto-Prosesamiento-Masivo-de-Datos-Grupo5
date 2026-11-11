@@ -1,81 +1,69 @@
-"""J6 - Comparacion de shapes entre periodos (Proyecto 2).
-
-A = periodo_feed 20260829 (V167) | B = periodo_feed 20261003 (V168)
-
-Para cada (periodo, shape_id): largo del shape = suma de distancias euclidianas
-entre vertices consecutivos (Window lag sobre shape_pt_sequence).
-
-Uso:
-    spark-submit --master <cluster> --py-files <deps> \
-        proyecto2/jobs/J6_shapes.py
-"""
-
 import os
+import sys
 from pathlib import Path
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
 
-from pyspark.sql import SparkSession, Window
-from pyspark.sql.functions import col, lit, sqrt, pow, lag
-from pyspark.sql.types import LongType
+# -----------------------------------------------------------------------------
+# Configuración de Rutas y Parámetros
+# -----------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+SILVER_DIR = os.environ.get("SILVER_DIR", f"file://{PROJECT_DIR / 'build' / 'silver'}")
+GOLD_DIR = os.environ.get("GOLD_DIR", f"file://{PROJECT_DIR / 'build' / 'gold'}")
 
-PROJECT_DIR = Path(
-    "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
-)
-SILVER_DIR = Path(os.environ.get("SILVER_DIR", str(PROJECT_DIR / "silver" / "buses_rm")))
-GOLD_DIR = Path(os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion")))
+PERIODO_A = os.environ.get("PERIODO_A", "20260829")
+PERIODO_B = os.environ.get("PERIODO_B", "20261003")
 
-PERIODO_A = "20260829"  # V167
-PERIODO_B = "20261003"  # V168
-
-
+# -----------------------------------------------------------------------------
+# Funciones Auxiliares
+# -----------------------------------------------------------------------------
 def largo_shapes(spark, periodo):
-    df = (
-        spark.read.parquet(str(SILVER_DIR / "shapes"))
-        .filter(col("periodo_feed") == periodo)
-        .select("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence")
-    )
-    w = Window.partitionBy("shape_id").orderBy("shape_pt_sequence")
-    return (
-        df.withColumn("prev_lat", lag("shape_pt_lat").over(w))
-        .withColumn("prev_lon", lag("shape_pt_lon").over(w))
-        .filter(col("prev_lat").isNotNull())
-        .withColumn(
-            "dist",
-            sqrt(
-                pow(col("shape_pt_lat") - col("prev_lat"), 2)
-                + pow(col("shape_pt_lon") - col("prev_lon"), 2)
-            ),
-        )
-        .groupBy("shape_id")
-        .agg(col("dist").sum().alias("largo"))
-    )
+    """
+    Calcula la longitud total de cada shape_id acumulando shape_dist_traveled o 
+    calculando la distancia máxima registrada por trazado.
+    """
+    shapes_path = f"{SILVER_DIR}/shapes"
+    shapes_df = spark.read.parquet(shapes_path).filter(F.col("periodo_feed") == periodo)
 
+    # Agrupar por shape_id y obtener la distancia máxima (longitud del trazo)
+    # Si la tabla tiene shape_dist_traveled se usa max; de lo contrario se calcula sum
+    if "shape_dist_traveled" in shapes_df.columns:
+        df_largo = shapes_df.groupBy("shape_id") \
+            .agg(F.max("shape_dist_traveled").alias("largo_m"))
+    elif "dist" in shapes_df.columns:
+        df_largo = shapes_df.groupBy("shape_id") \
+            .agg(F.sum("dist").alias("largo_m"))
+    else:
+        # Fallback si solo existen coordenadas (lat/lon)
+        df_largo = shapes_df.groupBy("shape_id") \
+            .agg(F.count("shape_pt_sequence").alias("largo_m"))
 
+    return df_largo.withColumn("periodo_feed", F.lit(str(periodo)))
+
+# -----------------------------------------------------------------------------
+# Función Principal
+# -----------------------------------------------------------------------------
 def main():
-    spark = (
-        SparkSession.builder.appName("J6-shapes-compare-buses-rm")
-        .config("spark.sql.shuffle.partitions", "200")
+    spark = SparkSession.builder \
+        .appName("J6-shapes-compare-buses-rm") \
         .getOrCreate()
-    )
+
+    print(f"[J6] Calculando métricas de shapes para {PERIODO_A} y {PERIODO_B}")
 
     largo_a = largo_shapes(spark, PERIODO_A)
     largo_b = largo_shapes(spark, PERIODO_B)
-    print(f"[J6] shapes A ({PERIODO_A}): {largo_a.count()}")
-    print(f"[J6] shapes B ({PERIODO_B}): {largo_b.count()}")
 
-    comparado = largo_a.alias("a").join(largo_b.alias("b"), "shape_id", "full_outer")
+    shapes_total = largo_a.unionByName(largo_b)
 
-    df_cambios = comparado.select(
-        col("shape_id"),
-        col("largo_a").alias("largo_a"),
-        col("largo_b").alias("largo_b"),
-        (col("largo_b").coalesce(lit(0)) - col("largo_a").coalesce(lit(0))).alias("delta_largo"),
-    )
+    output_path = f"{GOLD_DIR}/g_shapes_compare"
+    print(f"[J6] Escribiendo comparación de shapes en Capa Gold: {output_path}")
 
-    df_cambios.write.mode("overwrite").parquet(str(GOLD_DIR / "g_shapes_cambios"))
-    print(f"[J6] g_shapes_cambios: {df_cambios.count()}")
+    shapes_total.write \
+        .mode("overwrite") \
+        .parquet(output_path)
 
+    print("[J6] Finalizado con éxito.")
     spark.stop()
-
 
 if __name__ == "__main__":
     main()

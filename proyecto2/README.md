@@ -40,7 +40,7 @@ tablas Gold con los cambios.
 ## Ejecución (en servidor)
 
 ```bash
-export DATASET_DIR=/tmp/opencode/gtfs_test     # dataset de prueba
+export DATASET_DIR="/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5/proyecto2/test_data"   # dataset de prueba (carpeta dentro del proyecto)
 export SILVER_DIR=/tmp/opencode/silver_test
 export GOLD_DIR=/tmp/opencode/gold_test
 export FIG_DIR=/tmp/opencode/figures_test

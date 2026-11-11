@@ -1,107 +1,92 @@
-"""J7 - Changelog unificado de cambios entre periodos (Proyecto 2).
-
-Consolida los cambios detectados por J1 (routes), J2 (stops) y J3 (headways)
-en una sola tabla Gold: g_changelog.
-
-Schema unificado:
-    entidad, entidad_id, estado, campo, valor_antes, valor_despues, detalle
-
-Uso:
-    spark-submit --master <cluster> --py-files <deps> \
-        proyecto2/jobs/J7_changelog.py
-"""
-
 import os
+import sys
 from pathlib import Path
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, unionAll
-from pyspark.sql.types import LongType
+import pyspark.sql.functions as F
 
-PROJECT_DIR = Path(
-    "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
-)
-GOLD_DIR = Path(os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion")))
+# -----------------------------------------------------------------------------
+# Configuración de Rutas y Parámetros
+# -----------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+GOLD_DIR = os.environ.get("GOLD_DIR", f"file://{PROJECT_DIR / 'build' / 'gold'}")
 
-PERIODO_A = "20260829"  # V167
-PERIODO_B = "20261003"  # V168
-
+PERIODO_A = os.environ.get("PERIODO_A", "20260829")
+PERIODO_B = os.environ.get("PERIODO_B", "20261003")
 
 def main():
-    spark = (
-        SparkSession.builder.appName("J7-changelog-buses-rm")
-        .config("spark.sql.shuffle.partitions", "200")
+    spark = SparkSession.builder \
+        .appName("J7-changelog-buses-rm") \
         .getOrCreate()
-    )
 
-    # --- Routes (J1) ---
-    routes = (
-        spark.read.parquet(str(GOLD_DIR / "g_routes_cambios"))
-        .filter(col("estado") != "SIN_CAMBIO")
+    print(f"[J7] Generando Changelog consolidado entre {PERIODO_A} y {PERIODO_B}")
+
+    # 1. Leer cambios de rutas
+    routes_df = spark.read.parquet(f"{GOLD_DIR}/g_routes_cambios")
+
+    # 2. Leer cambios de paradas
+    stops_df = spark.read.parquet(f"{GOLD_DIR}/g_stops_cambios")
+
+    # 3. Leer headways y calcular la diferencia/estado entre periodos
+    headways_raw = spark.read.parquet(f"{GOLD_DIR}/headways")
+
+    hw_a = headways_raw.filter(F.col("periodo_feed") == PERIODO_A) \
         .select(
-            lit("route").alias("entidad"),
-            col("route_id").alias("entidad_id"),
-            col("estado"),
-            lit("route").alias("campo"),
-            col("route_short_name_a").alias("valor_antes"),
-            col("route_short_name_b").alias("valor_despues"),
-            lit("n/a").alias("detalle"),
+            F.col("route_id"),
+            F.col("direction_id"),
+            F.col("avg_headway_secs").alias("hw_a"),
+            F.col("total_trips").alias("trips_a")
         )
-    )
 
-    # --- Stops (J2) ---
-    stops = (
-        spark.read.parquet(str(GOLD_DIR / "g_stops_cambios"))
-        .filter(col("estado") != "SIN_CAMBIO")
+    hw_b = headways_raw.filter(F.col("periodo_feed") == PERIODO_B) \
         .select(
-            lit("stop").alias("entidad"),
-            col("stop_id").alias("entidad_id"),
-            col("estado"),
-            lit("stop").alias("campo"),
-            col("stop_name_a").alias("valor_antes"),
-            col("stop_name_b").alias("valor_despues"),
-            col("movido").alias("detalle"),
+            F.col("route_id"),
+            F.col("direction_id"),
+            F.col("avg_headway_secs").alias("hw_b"),
+            F.col("total_trips").alias("trips_b")
         )
+
+    hw_joined = hw_a.join(hw_b, on=["route_id", "direction_id"], how="outer")
+
+    hw_cambios = hw_joined.withColumn(
+        "estado",
+        F.when(F.col("hw_a").isNull(), F.lit("NUEVO"))
+         .when(F.col("hw_b").isNull(), F.lit("ELIMINADO"))
+         .when(F.abs(F.col("hw_b") - F.col("hw_a")) > 60, F.lit("MODIFICADO"))
+         .otherwise(F.lit("SIN_CAMBIO"))
+    ).filter(F.col("estado") != "SIN_CAMBIO")
+
+    # 4. Normalizar columnas para realizar el Union Consolidado
+    routes_changelog = routes_df.select(
+        F.col("route_id").alias("entity_id"),
+        F.col("estado"),
+        F.lit("route").alias("tipo_cambio")
     )
 
-    # --- Headways (J3) ---
-    headways = (
-        spark.read.parquet(str(GOLD_DIR / "g_headway_cambios"))
-        .filter(col("estado") != "SIN_CAMBIO")
-        .select(
-            lit("trip_headway").alias("entidad"),
-            col("trip_id").alias("entidad_id"),
-            col("estado"),
-            lit("headway_secs").alias("campo"),
-            col("headway_a").alias("valor_antes"),
-            col("headway_b").alias("valor_despues"),
-            lit(None).alias("detalle"),
-        )
-        .unionAll(
-            spark.read.parquet(str(GOLD_DIR / "g_headway_cambios"))
-            .filter(
-                (col("estado") == "MODIFICADO")
-                & (col("n_salidas_a") != col("n_salidas_b"))
-            )
-            .select(
-                lit("trip_headway").alias("entidad"),
-                col("trip_id").alias("entidad_id"),
-                lit("MODIFICADO").alias("estado"),
-                lit("n_salidas").alias("campo"),
-                col("n_salidas_a").alias("valor_antes"),
-                col("n_salidas_b").alias("valor_despues"),
-                lit(None).alias("detalle"),
-            )
-        )
+    stops_changelog = stops_df.select(
+        F.col("stop_id").alias("entity_id"),
+        F.col("estado"),
+        F.lit("stop").alias("tipo_cambio")
     )
 
-    changelog = routes.unionAll(stops).unionAll(headways)
+    hw_changelog = hw_cambios.select(
+        F.col("route_id").alias("entity_id"),
+        F.col("estado"),
+        F.lit("headway").alias("tipo_cambio")
+    )
 
-    changelog.write.mode("overwrite").parquet(str(GOLD_DIR / "g_changelog"))
-    print(f"[J7] g_changelog: {changelog.count()}")
+    changelog = routes_changelog \
+        .unionByName(stops_changelog) \
+        .unionByName(hw_changelog)
 
+    output_path = f"{GOLD_DIR}/g_changelog"
+    print(f"[J7] Escribiendo changelog consolidado en Capa Gold: {output_path}")
+
+    changelog.write \
+        .mode("overwrite") \
+        .parquet(output_path)
+
+    print("[J7] Finalizado con éxito.")
     spark.stop()
-
 
 if __name__ == "__main__":
     main()

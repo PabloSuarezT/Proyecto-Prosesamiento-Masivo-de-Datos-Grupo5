@@ -1,132 +1,191 @@
-"""Fase final (Proyecto 2) - Generacion de figuras a partir de las tablas Gold.
+"""
+Fase final (Proyecto 2) - Generación de figuras a partir de las tablas Gold.
 
-Lee las tablas Gold del comparativo V167 -> V168 y genera figuras (PNG) con matplotlib.
-
-Figuras:
-    1. Headways modificados (delta headway A -> B) por trip.
-    2. Delta de salidas/dia por recorrido (route x direction x service).
-    3. Delta de buses/dia por paradero (top ganan / top pierden).
-    4. Conteos de cambios por entidad y estado.
+Lee los datasets Parquet de la Capa Gold (build/gold) usando Pandas y PyArrow,
+y genera gráficos (.png) optimizados y sin errores visuales de formato.
 
 Uso:
-    python3 generar_figuras.py
+    python3 figures.py
 """
 
 import os
 from pathlib import Path
-
+import pandas as pd
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
-from pyspark.sql.types import LongType
 
-PROJECT_DIR = Path(
-    "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
-)
-GOLD_DIR = Path(os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion")))
-OUT_DIR = Path(os.environ.get("FIG_DIR", str(PROJECT_DIR / "figures")))
+# -----------------------------------------------------------------------------
+# Configuración de Rutas y Estilos
+# -----------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).resolve().parent
+
+raw_gold = os.environ.get("GOLD_DIR", str(PROJECT_DIR / "build" / "gold"))
+GOLD_DIR = raw_gold.replace("file://", "")
+FIG_DIR = os.environ.get("FIG_DIR", str(PROJECT_DIR / "build" / "figures"))
 
 FMT = ".png"
-
-
-def _spark():
-    return SparkSession.builder.appName("figuras-buses-rm").config(
-        "spark.sql.shuffle.partitions", "200"
-    ).getOrCreate()
+plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
 
 
 def fig_headway_changes():
-    df = (
-        _spark()
-        .read.parquet(str(GOLD_DIR / "g_headway_cambios"))
-        .filter(col("estado") == lit("MODIFICADO"))
-        .select(col("trip_id"), col("headway_a").alias("headway_a"), col("headway_b").alias("headway_b"))
-    )
-    pdf = df.toPandas().sort_values("headway_b", ascending=False).head(20)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(pdf["trip_id"].astype(str), (pdf["headway_b"] - pdf["headway_a"]).astype(float), color="steelblue")
-    ax.set_xlabel("Delta headway (B - A) en segundos")
-    ax.set_title("Headways modificados entre V167 (20260829) y V168 (20261003)")
-    plt.tight_layout()
-    plt.savefig(str(OUT_DIR / f"fig1_headway_changes{FMT}"))
-    plt.close()
+    """Pregunta 3: Recorridos que cambiaron su frecuencia (Headways)."""
+    path = os.path.join(GOLD_DIR, "headways")
+    if not os.path.exists(path):
+        print(f"[WARN] No existe {path}, omitiendo fig1.")
+        return
+
+    df = pd.read_parquet(path)
+    if "periodo_feed" not in df.columns or "avg_headway_secs" not in df.columns:
+        print("[WARN] Columnas necesarias no presentes en headways.")
+        return
+
+    pivot = df.pivot_table(
+        index=["route_id", "direction_id"],
+        columns="periodo_feed",
+        values="avg_headway_secs",
+        observed=False
+    ).reset_index()
+
+    periodos = [c for c in pivot.columns if c not in ["route_id", "direction_id"]]
+    if len(periodos) >= 2:
+        col_a, col_b = periodos[0], periodos[1]
+        pivot["delta_headway"] = pivot[col_b] - pivot[col_a]
+        
+        pdf = pivot[pivot["delta_headway"].abs() > 60].sort_values("delta_headway", ascending=False).head(20)
+
+        if not pdf.empty:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            labels = pdf["route_id"].astype(str) + " (Dir: " + pdf["direction_id"].astype(str) + ")"
+            colors = ["crimson" if x > 0 else "seagreen" for x in pdf["delta_headway"]]
+            
+            bars = ax.barh(labels, pdf["delta_headway"], color=colors, height=0.4)
+            ax.set_xlabel("Delta Headway Promedio (B - A) [Segundos]")
+            ax.set_ylabel("Recorrido (Dirección)")
+            ax.set_title("Top 20 Variaciones de Frecuencia (Verde = Menos espera, Rojo = Mayor espera)")
+            
+            # Anotar valor numérico centrado sobre la barra para no encimarlo con el eje Y
+            for bar in bars:
+                width = bar.get_width()
+                ax.text(
+                    width / 2,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{int(width)}s",
+                    va="center",
+                    ha="center",
+                    color="white",
+                    fontsize=10,
+                    fontweight="bold"
+                )
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(FIG_DIR, f"fig1_headway_changes{FMT}"), dpi=300)
+            plt.close()
+            print("[OK] Generada fig1_headway_changes.png")
 
 
 def fig_delta_salidas_recorrido():
-    df = (
-        _spark()
-        .read.parquet(str(GOLD_DIR / "g_recorrido_delta"))
-        .filter(col("salidas_a").isNotNull())
-        .select("route_id", "direction_id", "service_id", "salidas_a", "salidas_b", "delta_salidas")
-    )
-    pdf = df.toPandas().sort_values("delta_salidas", ascending=False).head(20)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(pdf["route_id"].astype(str), pdf["delta_salidas"].astype(float), color="seagreen")
-    ax.set_xlabel("Delta salidas/dia (B - A)")
-    ax.set_title("Cambios en salidas por dia entre V167 y V168")
-    plt.tight_layout()
-    plt.savefig(str(OUT_DIR / f"fig2_delta_salidas_recorrido{FMT}"))
-    plt.close()
+    """Preguntas 3 y 4: Delta de viajes/salidas por día por recorrido."""
+    path = os.path.join(GOLD_DIR, "g_oferta_hora")
+    if not os.path.exists(path):
+        print(f"[WARN] No existe {path}, omitiendo fig2.")
+        return
+
+    df = pd.read_parquet(path)
+    if "total_trips" in df.columns and "periodo_feed" in df.columns:
+        grp = df.groupby(["route_id", "periodo_feed"])["total_trips"].sum().unstack(fill_value=0).reset_index()
+        periodos = [c for c in grp.columns if c != "route_id"]
+        if len(periodos) >= 2:
+            col_a, col_b = periodos[0], periodos[1]
+            grp["delta_salidas"] = grp[col_b] - grp[col_a]
+            
+            pdf = grp[grp["delta_salidas"] != 0].sort_values("delta_salidas", ascending=False).head(20)
+
+            if not pdf.empty:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                colors = ["seagreen" if x > 0 else "crimson" for x in pdf["delta_salidas"]]
+                ax.barh(pdf["route_id"].astype(str), pdf["delta_salidas"], color=colors)
+                ax.set_xlabel("Delta de Salidas / Viajes Diarios (B - A)")
+                ax.set_title("Variación Neta de Oferta Diaria por Recorrido")
+                plt.tight_layout()
+                plt.savefig(os.path.join(FIG_DIR, f"fig2_delta_salidas_recorrido{FMT}"), dpi=300)
+                plt.close()
+                print("[OK] Generada fig2_delta_salidas_recorrido.png")
 
 
 def fig_delta_paraderos():
-    df = (
-        _spark()
-        .read.parquet(str(GOLD_DIR / "g_delta_paraderos"))
-        .filter(col("buses_dia_a").isNotNull())
-        .select("service_id", "stop_id", "buses_dia_a", "buses_dia_b", "delta_buses_dia")
-    )
-    pdf = df.toPandas().sort_values("delta_buses_dia", ascending=False).head(20)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(pdf["stop_id"].astype(str), pdf["delta_buses_dia"].astype(float), color="crimson")
-    ax.set_xlabel("Delta buses/dia (B - A)")
-    ax.set_title("Impacto en paraderos entre V167 y V168")
-    plt.tight_layout()
-    plt.savefig(str(OUT_DIR / f"fig3_delta_paraderos{FMT}"))
-    plt.close()
+    """Preguntas 2 y 5: Impacto operacional y estado de paraderos."""
+    path = os.path.join(GOLD_DIR, "g_stops_cambios")
+    if not os.path.exists(path):
+        print(f"[WARN] No existe {path}, omitiendo fig3.")
+        return
+
+    df = pd.read_parquet(path)
+    if "estado" in df.columns and "stop_id" in df.columns:
+        pdf = df[df["estado"] != "SIN_CAMBIO"]
+        if not pdf.empty:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            counts = pdf["estado"].value_counts()
+            bars = ax.bar(counts.index.astype(str), counts.values, color="darkorange", width=0.4, edgecolor="black")
+            
+            ax.set_xlabel("Estado de Cambio en Paraderos")
+            ax.set_ylabel("Cantidad de Paraderos Afectados")
+            ax.set_title("Distribución de Paraderos Modificados / Eliminados")
+            
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    height + 0.05,
+                    f"{int(height)}",
+                    ha="center",
+                    va="bottom",
+                    fontweight="bold"
+                )
+
+            ax.set_ylim(0, max(counts.values) + 1)
+            plt.tight_layout()
+            plt.savefig(os.path.join(FIG_DIR, f"fig3_delta_paraderos{FMT}"), dpi=300)
+            plt.close()
+            print("[OK] Generada fig3_delta_paraderos.png")
 
 
 def fig_counts_estados():
-    frames = []
-    specs = [
-        ("route", "g_routes_cambios", "route_id"),
-        ("stop", "g_stops_cambios", "stop_id"),
-        ("trip_headway", "g_headway_cambios", "trip_id"),
-        ("shape", "g_shapes_cambios", "shape_id"),
-    ]
-    for entidad, tabla, id_col in specs:
-        df = (
-            _spark()
-            .read.parquet(str(GOLD_DIR / tabla))
-            .filter(col("estado") != lit("SIN_CAMBIO"))
-            .select(lit(entidad).alias("entidad"), col(id_col).alias("entidad_id"), col("estado"))
-        )
-        frames.append(df.toPandas())
-    import pandas as pd
+    """Preguntas 1 y 5: Conteo consolidado de cambios por entidad y estado."""
+    path = os.path.join(GOLD_DIR, "g_changelog")
+    if not os.path.exists(path):
+        print(f"[WARN] No existe {path}, omitiendo fig4.")
+        return
 
-    pdf = pd.concat(frames, ignore_index=True)
-    counts = pdf.groupby(["entidad", "estado"]).size().reset_index(name="n")
+    pdf = pd.read_parquet(path)
+    counts = pdf.groupby(["tipo_cambio", "estado"]).size().unstack(fill_value=0)
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    for estado, grp in counts.groupby("estado"):
-        ax.barh(grp["entidad"].astype(str), grp["n"].astype(float), label=estado)
-    ax.set_xlabel("Cantidad de cambios")
-    ax.set_title("Cambios detectados por entidad y estado (V167 -> V168)")
-    ax.legend()
+    counts.plot(kind="barh", stacked=True, ax=ax, colormap="tab10")
+    
+    ax.set_xlabel("Cantidad de entidades afectadas")
+    ax.set_ylabel("Tipo de Entidad")
+    ax.set_title("Resumen General del Changelog Consolidado (V167 -> V168)")
+    
+    totals = counts.sum(axis=1)
+    for i, total in enumerate(totals):
+        ax.text(total + 0.05, i, str(int(total)), va="center", fontweight="bold")
+
     plt.tight_layout()
-    plt.savefig(str(OUT_DIR / f"fig4_counts_estados{FMT}"))
+    plt.savefig(os.path.join(FIG_DIR, f"fig4_counts_estados{FMT}"), dpi=300)
     plt.close()
+    print("[OK] Generada fig4_counts_estados.png")
 
 
 def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    os.makedirs(FIG_DIR, exist_ok=True)
+    print(f"[FASE FINAL] Generando figuras optimizadas en: {FIG_DIR}")
     fig_headway_changes()
     fig_delta_salidas_recorrido()
     fig_delta_paraderos()
     fig_counts_estados()
-    print("[FASE FINAL] Figuras generadas en", OUT_DIR)
+    print(f"[FASE FINAL] ¡Proceso completado con éxito! Revisa '{FIG_DIR}'.")
 
 
 if __name__ == "__main__":

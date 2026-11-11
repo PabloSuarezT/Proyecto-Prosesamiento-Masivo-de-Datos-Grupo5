@@ -1,131 +1,96 @@
-"""J5b - Oferta real por paradero y hora entre periodos (Proyecto 2).
-
-A = periodo_feed 20260829 (V167) | B = periodo_feed 20261003 (V168)
-
-Expande las salidas (frequencies + k) -> join stop_times -> pasadas absolutas
-(pasada_seg = salida_seg + t_rel) -> agrupa por (service_id, stop_id, hora_reloj)
--> buses por hora. Luego full outer join A vs B -> delta.
-
-Uso:
-    spark-submit --master <cluster> --py-files <deps> \
-        proyecto2/jobs/J5b_oferta_hora.py
-"""
-
 import os
+import sys
 from pathlib import Path
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, udf, explode, sequence
-from pyspark.sql.types import LongType
+import pyspark.sql.functions as F
 
-PROJECT_DIR = Path(
-    "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
-)
-SILVER_DIR = Path(os.environ.get("SILVER_DIR", str(PROJECT_DIR / "silver" / "buses_rm")))
-GOLD_DIR = Path(os.environ.get("GOLD_DIR", str(PROJECT_DIR / "gold" / "comparacion")))
+# -----------------------------------------------------------------------------
+# Configuración de Rutas y Parámetros
+# -----------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+SILVER_DIR = os.environ.get("SILVER_DIR", f"file://{PROJECT_DIR / 'build' / 'silver'}")
+GOLD_DIR = os.environ.get("GOLD_DIR", f"file://{PROJECT_DIR / 'build' / 'gold'}")
 
-PERIODO_A = "20260829"  # V167
-PERIODO_B = "20261003"  # V168
+PERIODO_A = os.environ.get("PERIODO_A", "20260829")
+PERIODO_B = os.environ.get("PERIODO_B", "20261003")
 
-
-@udf(returnType=LongType())
-def to_seconds(t):
-    """Convierte un tiempo GTFS 'H+:MM:SS' (puede superar las 24h) a segundos."""
-    if t is None or str(t).strip() == "":
-        return None
-    parts = str(t).strip().split(":")
-    h = int(float(parts[0]))
-    m = int(float(parts[1])) if len(parts) > 1 else 0
-    s = int(float(parts[2])) if len(parts) > 2 else 0
-    return int(h * 3600 + m * 60 + s)
-
-
-def salidas(spark, periodo):
-    df = (
-        spark.read.parquet(str(SILVER_DIR / "frequencies"))
-        .filter(col("periodo_feed") == periodo)
-        .withColumn("ini_seg", udf("to_seconds")(col("start_time")))
-        .withColumn("fin_seg", udf("to_seconds")(col("end_time")))
-        .withColumn("headway_secs", col("headway_secs").cast("long"))
-        .join(
-            spark.read.parquet(str(SILVER_DIR / "trips")).filter(
-                col("periodo_feed") == periodo
-            ),
-            ["periodo_feed", "trip_id"],
-        )
-        .select(
-            "periodo_feed",
-            "trip_id",
-            "service_id",
-            "route_id",
-            "direction_id",
-            "headway_secs",
-            "ini_seg",
-            "fin_seg",
-        )
-    )
-    df = df.filter(
-        col("fin_seg").isNotNull()
-        & (col("fin_seg") > col("ini_seg"))
-        & (col("headway_secs") > lit(0))
-    )
-    df = df.withColumn(
-        "n_salidas",
-        ((col("fin_seg") - col("ini_seg") - lit(1)) / col("headway_secs"))
-        .cast("int")
-        .cast("long")
-        + lit(1),
-    )
-    df = df.filter(col("n_salidas") > lit(0))
-    df = df.withColumn("k", explode(sequence(lit(0), col("n_salidas") - lit(1))))
-    return df.withColumn("salida_seg", col("ini_seg") + col("k") * col("headway_secs"))
-
-
-def oferta(periodo, spark, salidas_df):
-    stop_times = (
-        spark.read.parquet(str(SILVER_DIR / "stop_times"))
-        .filter(col("periodo_feed") == periodo)
-        .select("trip_id", "stop_id", "departure_secs")
-    )
+# -----------------------------------------------------------------------------
+# Funciones Auxiliares
+# -----------------------------------------------------------------------------
+def time_to_secs(col_name):
+    """
+    Convierte 'HH:MM:SS' a segundos del día (soporta horas GTFS > 24).
+    """
+    parts = F.split(F.col(col_name), ":")
     return (
-        salidas_df.join(stop_times, "trip_id")
-        .withColumn("pasada_seg", col("salida_seg") + col("departure_secs"))
-        .withColumn("hora_servicio", (col("pasada_seg") / lit(3600)).cast("int"))
-        .withColumn("hora_reloj", col("hora_servicio") % 24)
-        .groupBy("service_id", "stop_id", "hora_reloj")
-        .count()
-        .withColumnRenamed("count", "buses")
+        parts.getItem(0).cast("int") * 3600 +
+        parts.getItem(1).cast("int") * 60 +
+        parts.getItem(2).cast("int")
     )
 
+def oferta(periodo, spark):
+    """
+    Calcula las salidas/viajes por hora cruzando stop_times + trips (Silver) con headways (Gold).
+    """
+    stop_times_path = f"{SILVER_DIR}/stop_times"
+    trips_path = f"{SILVER_DIR}/trips"
+    headways_path = f"{GOLD_DIR}/headways"
 
+    stop_times_df = spark.read.parquet(stop_times_path).filter(F.col("periodo_feed") == periodo)
+    trips_df = spark.read.parquet(trips_path).filter(F.col("periodo_feed") == periodo)
+    headways_df = spark.read.parquet(headways_path).filter(F.col("periodo_feed") == periodo)
+
+    # 1. Obtener la hora del día a partir de departure_time en stop_times
+    st_periodo = stop_times_df \
+        .withColumn("departure_time_secs", time_to_secs("departure_time")) \
+        .withColumn("hora", (F.floor(F.col("departure_time_secs") / 3600) % 24).cast("int")) \
+        .select("trip_id", "stop_id", "hora")
+
+    # 2. Relacionar trip_id con route_id y direction_id mediante trips
+    st_trips = st_periodo.join(
+        trips_df.select("trip_id", "route_id", "direction_id"),
+        on="trip_id",
+        how="inner"
+    )
+
+    # 3. Cruzar con headways para validar la oferta del servicio
+    joined = st_trips.join(
+        headways_df.select("route_id", "direction_id", "avg_headway_secs"),
+        on=["route_id", "direction_id"],
+        how="inner"
+    )
+
+    # 4. Agrupar por hora para obtener salidas distintas
+    oferta_hora = joined.groupBy("hora") \
+        .agg(F.countDistinct("trip_id").alias("salidas_hora")) \
+        .withColumn("periodo_feed", F.lit(str(periodo)))
+
+    return oferta_hora
+
+# -----------------------------------------------------------------------------
+# Función Principal
+# -----------------------------------------------------------------------------
 def main():
-    spark = (
-        SparkSession.builder.appName("J5b-oferta-hora-buses-rm")
-        .config("spark.sql.shuffle.partitions", "200")
+    spark = SparkSession.builder \
+        .appName("J5b-oferta-hora-buses-rm") \
         .getOrCreate()
-    )
 
-    oferta_a = oferta(PERIODO_A, spark, salidas(spark, PERIODO_A))
-    oferta_b = oferta(PERIODO_B, spark, salidas(spark, PERIODO_B))
-    print(f"[J5b] oferta A ({PERIODO_A}): {oferta_a.count()}")
-    print(f"[J5b] oferta B ({PERIODO_B}): {oferta_b.count()}")
+    print(f"[J5b] Calculando oferta por hora para {PERIODO_A} y {PERIODO_B}")
 
-    comparado = oferta_a.alias("a").join(oferta_b.alias("b"), ["service_id", "stop_id", "hora_reloj"], "full_outer")
+    oferta_a = oferta(PERIODO_A, spark)
+    oferta_b = oferta(PERIODO_B, spark)
 
-    df_delta = comparado.select(
-        col("service_id"),
-        col("stop_id"),
-        col("hora_reloj"),
-        col("buses_a").alias("buses_a"),
-        col("buses_b").alias("buses_b"),
-        (col("buses_b").coalesce(lit(0)) - col("buses_a").coalesce(lit(0))).alias("delta_buses"),
-    )
+    oferta_total = oferta_a.unionByName(oferta_b)
 
-    df_delta.write.mode("overwrite").parquet(str(GOLD_DIR / "g_delta_oferta_hora"))
-    print(f"[J5b] g_delta_oferta_hora: {df_delta.count()}")
+    output_path = f"{GOLD_DIR}/g_oferta_hora"
+    print(f"[J5b] Escribiendo oferta por hora en Capa Gold: {output_path}")
 
+    oferta_total.write \
+        .mode("overwrite") \
+        .parquet(output_path)
+
+    print("[J5b] Finalizado con éxito.")
     spark.stop()
-
 
 if __name__ == "__main__":
     main()
