@@ -1,12 +1,11 @@
 """J0 - Ingesta del GTFS unificado de buses RM hacia la capa Silver (Proyecto 2).
 
 Lee los CSV del dataset unificado (dos periodos: periodo_feed A y B),
-aplica validaciones basicas, convierte los tiempos a segundos y escribe
+aplica validaciones básicas, convierte los tiempos a segundos y escribe
 las tablas a Parquet particionado por periodo_feed (capa Silver).
 
 Uso:
-    spark-submit --master <cluster> --py-files <deps> \
-        proyecto2/jobs/J0_ingest.py
+    spark-submit jobs/J0_ingest.py
 """
 
 import os
@@ -16,13 +15,18 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf
 from pyspark.sql.types import LongType
 
-PROJECT_DIR = Path(
-    "/home/pablo/Universidad/DCC/2do Año/Prosasamiento masivo de dartos/Proyecto-Grupo5"
-)
-DATASET_DIR = os.environ.get("DATASET_DIR", str(PROJECT_DIR / "dataset_buses_rm 2" / "dataset_buses_rm"))
-SILVER_DIR = os.environ.get("SILVER_DIR", str(PROJECT_DIR / "silver" / "buses_rm"))
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-# (tabla, archivo, tiene_periodo_feed, columnas de tiempo a convertir)
+# Rutas configurables por variables de entorno (por defecto usa las del proyecto)
+DATASET_DIR = os.environ.get(
+    "DATASET_DIR", 
+    str(PROJECT_DIR / "dataset_buses_rm" / "dataset_buses_rm")
+)
+SILVER_DIR = os.environ.get(
+    "SILVER_DIR", 
+    str(PROJECT_DIR / "build" / "silver" / "buses_rm")
+)
+
 TABLES = [
     ("trips", "trips_buses_rm.csv", True, ["start_time", "end_time"]),
     ("stop_times", "stop_times_buses_rm.csv", True, ["arrival_time", "departure_time"]),
@@ -39,11 +43,14 @@ def to_seconds(t):
     """Convierte un tiempo GTFS 'H+:MM:SS' (puede superar las 24h) a segundos."""
     if t is None or str(t).strip() == "":
         return None
-    parts = str(t).strip().split(":")
-    h = int(float(parts[0]))
-    m = int(float(parts[1])) if len(parts) > 1 else 0
-    s = int(float(parts[2])) if len(parts) > 2 else 0
-    return int(h * 3600 + m * 60 + s)
+    try:
+        parts = str(t).strip().split(":")
+        h = int(float(parts[0]))
+        m = int(float(parts[1])) if len(parts) > 1 else 0
+        s = int(float(parts[2])) if len(parts) > 2 else 0
+        return int(h * 3600 + m * 60 + s)
+    except (ValueError, IndexError):
+        return None
 
 
 to_seconds_udf = udf(to_seconds, LongType())
@@ -56,30 +63,40 @@ def main():
         .getOrCreate()
     )
 
+    print(f"[J0] Procesando desde: {DATASET_DIR}")
+    print(f"[J0] Guardando en: {SILVER_DIR}")
+
     for tabla, archivo, tiene_periodo, cols_tiempo in TABLES:
-        df = spark.read.option("header", True).option("inferSchema", True).csv(
-            f"{DATASET_DIR}/{archivo}"
-        )
+        # Limpiar el prefijo file:// para que os.path.exists funcione bien localmente
+        clean_dataset_dir = DATASET_DIR.replace("file://", "") if DATASET_DIR.startswith("file://") else DATASET_DIR
+        input_file_path = os.path.join(clean_dataset_dir, archivo)
+        
+        if not os.path.exists(input_file_path):
+            print(f"[{tabla}] WARN: No existe el archivo {input_file_path}, omitiendo...")
+            continue
 
-        out_path = f"{SILVER_DIR}/{tabla}"
-        if tiene_periodo:
-            df = df.withColumn("periodo_feed", col("periodo_feed").cast("string"))
-            periodos = (
-                df.select("periodo_feed").distinct().orderBy("periodo_feed").collect()
-            )
-            periodos = [r[0] for r in periodos]
-            print(f"[{tabla}] periodos: {periodos}")
-            writer = df.write.mode("overwrite").partitionBy("periodo_feed")
-        else:
-            periodos = None
-            writer = df.write.mode("overwrite")
+        # Spark lee usando la ruta original (con o sin file://)
+        input_file_spark = f"{DATASET_DIR}/{archivo}"
+        df = spark.read.option("header", True).option("inferSchema", True).csv(input_file_spark)
 
-        for col_time in ["start_time", "end_time", "arrival_time", "departure_time"]:
+        # 1. Transformación de columnas de tiempo a segundos
+        for col_time in cols_tiempo:
             if col_time in df.columns:
                 df = df.withColumn(f"{col_time}_secs", to_seconds_udf(col(col_time)))
 
-        writer.parquet(out_path)
-        print(f"[{tabla}] filas: {df.count()}")
+        out_path = f"{SILVER_DIR}/{tabla}"
+
+        # 2. Escritura particionada si corresponde
+        if tiene_periodo and "periodo_feed" in df.columns:
+            df = df.withColumn("periodo_feed", col("periodo_feed").cast("string"))
+            periodos = [r[0] for r in df.select("periodo_feed").distinct().orderBy("periodo_feed").collect()]
+            print(f"[{tabla}] periodos: {periodos}")
+            
+            df.write.mode("overwrite").partitionBy("periodo_feed").parquet(out_path)
+        else:
+            df.write.mode("overwrite").parquet(out_path)
+
+        print(f"[{tabla}] procesadas filas: {df.count()}")
 
     spark.stop()
 
