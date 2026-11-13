@@ -65,7 +65,6 @@ def fig_headway_changes():
             ax.set_ylabel("Recorrido (Dirección)")
             ax.set_title("Top 20 Variaciones de Frecuencia (Verde = Menos espera, Rojo = Mayor espera)")
             
-            # Anotar valor numérico centrado sobre la barra para no encimarlo con el eje Y
             for bar in bars:
                 width = bar.get_width()
                 ax.text(
@@ -86,32 +85,57 @@ def fig_headway_changes():
 
 
 def fig_delta_salidas_recorrido():
-    """Preguntas 3 y 4: Delta de viajes/salidas por día por recorrido."""
+    """Pregunta 4/5: Comparativa de Oferta Total de Salidas Diarias (V167 vs V168)."""
     path = os.path.join(GOLD_DIR, "g_oferta_hora")
     if not os.path.exists(path):
         print(f"[WARN] No existe {path}, omitiendo fig2.")
         return
 
     df = pd.read_parquet(path)
-    if "total_trips" in df.columns and "periodo_feed" in df.columns:
-        grp = df.groupby(["route_id", "periodo_feed"])["total_trips"].sum().unstack(fill_value=0).reset_index()
-        periodos = [c for c in grp.columns if c != "route_id"]
-        if len(periodos) >= 2:
-            col_a, col_b = periodos[0], periodos[1]
-            grp["delta_salidas"] = grp[col_b] - grp[col_a]
-            
-            pdf = grp[grp["delta_salidas"] != 0].sort_values("delta_salidas", ascending=False).head(20)
+    
+    # Si 'hora' es NaN, sumamos las salidas por periodo_feed
+    if "periodo_feed" in df.columns and "salidas_hora" in df.columns:
+        # Agrupamos por periodo por si acaso hay múltiples filas
+        resumen = df.groupby("periodo_feed")["salidas_hora"].sum().reset_index()
 
-            if not pdf.empty:
-                fig, ax = plt.subplots(figsize=(10, 6))
-                colors = ["seagreen" if x > 0 else "crimson" for x in pdf["delta_salidas"]]
-                ax.barh(pdf["route_id"].astype(str), pdf["delta_salidas"], color=colors)
-                ax.set_xlabel("Delta de Salidas / Viajes Diarios (B - A)")
-                ax.set_title("Variación Neta de Oferta Diaria por Recorrido")
-                plt.tight_layout()
-                plt.savefig(os.path.join(FIG_DIR, f"fig2_delta_salidas_recorrido{FMT}"), dpi=300)
-                plt.close()
-                print("[OK] Generada fig2_delta_salidas_recorrido.png")
+        if len(resumen) >= 2:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            
+            bars = ax.bar(
+                resumen["periodo_feed"].astype(str),
+                resumen["salidas_hora"],
+                color=["royalblue", "darkorange"],
+                width=0.5,
+                edgecolor="black"
+            )
+
+            ax.set_xlabel("Periodo Feed (V167 vs V168)")
+            ax.set_ylabel("Total de Salidas Diarias en la Red")
+            ax.set_title("Comparativa de Oferta Total Diaria de Buses")
+            
+            # Anotar los valores sobre las barras
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    height + 100,
+                    f"{int(height):,}",
+                    ha="center",
+                    va="bottom",
+                    fontweight="bold"
+                )
+
+            # Ajustar límite Y para dar espacio a los textos
+            ax.set_ylim(0, resumen["salidas_hora"].max() * 1.15)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(FIG_DIR, f"fig2_delta_salidas_recorrido{FMT}"), dpi=300)
+            plt.close()
+            print("[OK] Generada fig2_delta_salidas_recorrido.png (Comparativa Total Diaria)")
+        else:
+            print("[WARN] Se requieren al menos 2 periodos en g_oferta_hora para graficar.")
+    else:
+        print("[ERROR] Las columnas de g_oferta_hora no coinciden con las esperadas.")
 
 
 def fig_delta_paraderos():
