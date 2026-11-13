@@ -1,5 +1,0 @@
-route_id,service_id,trip_id,trip_headsign,direction_id,shape_id,trip_short_name,wheelchair_accessible,bikes_allowed,periodo_feed
-101,L,1,Terminal Central,0,1,101,1,0,20260829
-101,L,2,Terminal Central,0,1,101,1,0,20260829
-101,L,1,Terminal Central,0,1,101,1,0,20261003
-101,L,3,Terminal Central,0,1,101,1,0,20261003
