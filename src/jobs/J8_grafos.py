@@ -106,9 +106,12 @@ def construir_y_analizar_grafo(spark, periodo):
         .join(cc, "id", "left")
         .fillna({"in_degree": 0, "out_degree": 0, "degree": 0, "pagerank": 0.0})
         .withColumn("periodo_feed", F.lit(str(periodo)))
+        .localCheckpoint(eager=True)
     )
 
-    edges_periodo = edges_df.withColumn("periodo_feed", F.lit(str(periodo)))
+    edges_periodo = edges_df.withColumn(
+        "periodo_feed", F.lit(str(periodo))
+    ).localCheckpoint(eager=True)
 
     # Resumen global del período
     resumen_row = nodos_metricas.agg(
@@ -118,7 +121,7 @@ def construir_y_analizar_grafo(spark, periodo):
         F.countDistinct("component").alias("n_componentes"),
     ).collect()[0]
 
-    n_aristas = edges_df.count()
+    n_aristas = edges_periodo.count()
     resumen = (
         str(periodo),
         int(resumen_row["n_nodos"]),
@@ -182,7 +185,7 @@ def main():
         nodos_a.alias("a")
         .join(nodos_b.alias("b"), "id", "full_outer")
         .select(
-            F.coalesce(F.col("a.id"), F.col("b.id")).alias("stop_id"),
+            F.col("id").alias("stop_id"),
             F.coalesce(F.col("b.stop_name"), F.col("a.stop_name")).alias("stop_name"),
             F.coalesce(F.col("b.stop_lat"), F.col("a.stop_lat")).alias("stop_lat"),
             F.coalesce(F.col("b.stop_lon"), F.col("a.stop_lon")).alias("stop_lon"),
@@ -227,8 +230,8 @@ def main():
         edges_a.alias("a")
         .join(edges_b.alias("b"), ["src", "dst"], "full_outer")
         .select(
-            F.coalesce(F.col("a.src"), F.col("b.src")).alias("src"),
-            F.coalesce(F.col("a.dst"), F.col("b.dst")).alias("dst"),
+            F.col("src"),
+            F.col("dst"),
             F.col("a.n_trips").alias("n_trips_a"),
             F.col("b.n_trips").alias("n_trips_b"),
             F.col("a.n_routes").alias("n_routes_a"),
