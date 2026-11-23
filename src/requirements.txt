@@ -4,6 +4,7 @@ cycler==0.12.1
 fastparquet==2026.9.0
 fonttools==4.65.0
 fsspec==2026.9.0
+graphframes==0.6
 kiwisolver==1.5.1
 matplotlib==3.10.9
 numpy==2.2.6
@@ -12,6 +13,7 @@ pandas==2.3.3
 pillow==12.3.0
 pyarrow==25.0.1
 pyparsing==3.3.3
+pyspark==4.3.0
 python-dateutil==3.0.0
 pytz==2026.6
 six==1.17.0
